@@ -256,3 +256,85 @@ PhaseAnalysisResult AnalysePhase(
 
     return result;
 }
+
+/*
+ *  Column extraction.  Allocates a dense  double  array of
+ *  length numberOfSamples containing the chosen phase voltage
+ *  of each sample.  Ownership passes to the caller, who is
+ *  expected to release the memory with free().
+ */
+double *CopyPhaseVoltagesToHeap(
+        const WaveformSample *pSamples,
+        size_t numberOfSamples,
+        PhaseIndex phase)
+{
+    if (pSamples == NULL || numberOfSamples == 0) return NULL;
+
+    double *pBuffer = (double *)malloc(numberOfSamples * sizeof(double));
+    if (pBuffer == NULL) return NULL;
+
+    for (size_t sampleIdx = 0; sampleIdx < numberOfSamples; ++sampleIdx) {
+        const WaveformSample *pCurrent = pSamples + sampleIdx;
+        *(pBuffer + sampleIdx) = PHASE_VOLTAGE(pCurrent, phase);
+    }
+
+    return pBuffer;
+}
+
+/*
+ *  Theory.
+ *      Selection sort realises the invariant
+ *
+ *          "at the start of iteration i, positions 0..i-1 hold
+ *           the i elements of greatest absolute value, arranged
+ *           in non-increasing order of |v|."
+ *
+ *      At iteration i the algorithm scans the unsorted tail
+ *      positions i..n-1 , locates the element of maximal |v|,
+ *      and exchanges it into position i.  Upon completion of
+ *      i = n-2  the invariant covers the whole array and the
+ *      algorithm terminates.
+ *
+ *      Complexity:  Theta(n^2) comparisons in all inputs.
+ *      Writes:      at most n - 1 swaps  (worst case).
+ *      Space:       Theta(1) auxiliary.
+ *
+ *      The number of writes is the fewest of any comparison
+ *      sort operating on a single array.  For n = 1000 the
+ *      algorithm terminates in well under a millisecond on
+ *      contemporary hardware.
+ *
+ *  Implementation.
+ *      The outer loop terminates at  i + 1 < bufferLength  so
+ *      that the trivial tail  [n-1..n-1]  is not scanned;  the
+ *      scan over a single-element range contributes no useful
+ *      work.  Element access is expressed through pointer
+ *      dereference -  *(pBuffer + j)  - rather than subscript,
+ *      in keeping with the pointer-arithmetic emphasis of the
+ *      coursework brief.
+ */
+void SelectionSortDescendingByAbsoluteValue(
+        double *pBuffer,
+        size_t bufferLength)
+{
+    if (pBuffer == NULL || bufferLength < 2) return;
+
+    for (size_t i = 0; i + 1 < bufferLength; ++i) {
+        size_t indexOfLargestMagnitude = i;
+        double largestMagnitudeSeen    = fabs(*(pBuffer + i));
+
+        for (size_t j = i + 1; j < bufferLength; ++j) {
+            double candidateMagnitude = fabs(*(pBuffer + j));
+            if (candidateMagnitude > largestMagnitudeSeen) {
+                largestMagnitudeSeen    = candidateMagnitude;
+                indexOfLargestMagnitude = j;
+            }
+        }
+
+        if (indexOfLargestMagnitude != i) {
+            double temporary = *(pBuffer + i);
+            *(pBuffer + i) = *(pBuffer + indexOfLargestMagnitude);
+            *(pBuffer + indexOfLargestMagnitude) = temporary;
+        }
+    }
+}
