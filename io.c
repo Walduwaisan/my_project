@@ -193,3 +193,276 @@ WaveformSample *LoadCsvFileIntoSampleArray(
     *pOutputRowCount = numberOfGoodRows;
     return pSamples;
 }
+
+/*
+ *  Emit one phase's contribution to the report, including the
+ *  "top N by magnitude" list produced via selection sort on a
+ *  scratch copy of the phase column.
+ */
+static void WritePhaseSection(
+        FILE                      *pFile,
+        const char                *pSectionNumber,
+        const char                *pPhaseLabel,
+        const PhaseAnalysisResult *pAnalysis,
+        const WaveformSample      *pSamples,
+        size_t                     numberOfSamples,
+        PhaseIndex                 phase)
+{
+    fprintf(pFile, "\n  %s  %s\n", pSectionNumber, pPhaseLabel);
+    fprintf(pFile, "  ----------------------------------------------------\n");
+    fprintf(pFile, "    Root-mean-square voltage ......... %12.4f V\n",
+            pAnalysis->rootMeanSquareVoltage);
+    fprintf(pFile, "    Peak-to-peak amplitude ........... %12.4f V\n",
+            pAnalysis->peakToPeakAmplitude);
+    fprintf(pFile, "    Observed minimum ................. %12.4f V\n",
+            pAnalysis->minimumVoltageValue);
+    fprintf(pFile, "    Observed maximum ................. %12.4f V\n",
+            pAnalysis->maximumVoltageValue);
+    fprintf(pFile, "    DC offset (arithmetic mean) ...... %12.6f V\n",
+            pAnalysis->directCurrentOffset);
+    fprintf(pFile, "    Population variance .............. %12.4f V^2\n",
+            pAnalysis->populationVariance);
+    fprintf(pFile, "    Standard deviation ............... %12.4f V\n",
+            pAnalysis->standardDeviation);
+    fprintf(pFile, "    Clipping events detected ......... %12zu\n",
+            pAnalysis->numberOfClippingEvents);
+    fprintf(pFile, "    Compliance (+/- %.0f %% of %.0f V) .. %12s\n",
+            RmsTolerancePercentage, NominalRmsVoltage,
+            pAnalysis->isWithinTolerance ? "COMPLIANT" : "NON-COMPLIANT");
+
+    fprintf(pFile, "    Status word ...................... 0b");
+    for (int bit = 7; bit >= 0; --bit) {
+        fprintf(pFile, "%d", (pAnalysis->statusFlags >> bit) & 1);
+    }
+    fprintf(pFile, "  (0x%02X)\n", pAnalysis->statusFlags);
+
+    if (pAnalysis->statusFlags & StatusBitClipping) {
+        fprintf(pFile,
+                "      bit 0 = SET : clipping threshold reached\n");
+    }
+    if (pAnalysis->statusFlags & StatusBitOutOfTolerance) {
+        fprintf(pFile,
+                "      bit 1 = SET : RMS outside +/- %.0f %% band\n",
+                RmsTolerancePercentage);
+    }
+    if (pAnalysis->statusFlags & StatusBitDcOffset) {
+        fprintf(pFile,
+                "      bit 2 = SET : significant DC offset\n");
+    }
+
+    /* Distinction extension: top-N by magnitude via in-project sort. */
+    double *pVoltages = CopyPhaseVoltagesToHeap(pSamples, numberOfSamples, phase);
+    if (pVoltages != NULL) {
+        SelectionSortDescendingByAbsoluteValue(pVoltages, numberOfSamples);
+        size_t howMany = (numberOfSamples < TOP_SAMPLES_DISPLAYED)
+                        ? numberOfSamples : TOP_SAMPLES_DISPLAYED;
+        fprintf(pFile, "    Top %zu samples by absolute magnitude:\n", howMany);
+        for (size_t rank = 0; rank < howMany; ++rank) {
+            fprintf(pFile,
+                    "      rank %zu : %+10.4f V  (|v| = %.4f)\n",
+                    rank + 1, *(pVoltages + rank), fabs(*(pVoltages + rank)));
+        }
+        free(pVoltages);
+    }
+}
+
+int WriteAnalysisReportToFile(
+        const char                *pOutputFilePath,
+        const char                *pSourceFileName,
+        const WaveformSample      *pSamples,
+        size_t                     numberOfSamples,
+        const PhaseAnalysisResult *pPhaseA,
+        const PhaseAnalysisResult *pPhaseB,
+        const PhaseAnalysisResult *pPhaseC)
+{
+    if (pOutputFilePath == NULL || pSamples == NULL ||
+        pPhaseA == NULL || pPhaseB == NULL || pPhaseC == NULL) {
+        fprintf(stderr, "WriteAnalysisReportToFile: NULL argument\n");
+        return 1;
+    }
+
+    FILE *pFile = fopen(pOutputFilePath, "w");
+    if (pFile == NULL) {
+        fprintf(stderr, "ERROR | unable to create output file: %s\n",
+                pOutputFilePath);
+        return 1;
+    }
+
+    /* ---- Header ---- */
+    fprintf(pFile,
+            "POWER QUALITY WAVEFORM ANALYSER\n"
+            "Analytical Report\n"
+            "====================================================\n\n");
+
+    fprintf(pFile, "  I.  Dataset description\n");
+    fprintf(pFile, "  ----------------------------------------------------\n");
+    fprintf(pFile, "    Source file ........ %s\n",
+            pSourceFileName ? pSourceFileName : "(unnamed)");
+    fprintf(pFile, "    Samples processed .. %zu\n", numberOfSamples);
+    if (numberOfSamples >= 2) {
+        double samplingInterval =
+            pSamples[1].sampleTimestampSeconds -
+            pSamples[0].sampleTimestampSeconds;
+        fprintf(pFile,
+                "    Time range ......... %.6f s  ->  %.6f s\n",
+                pSamples[0].sampleTimestampSeconds,
+                pSamples[numberOfSamples - 1].sampleTimestampSeconds);
+        if (samplingInterval > 0.0) {
+            fprintf(pFile, "    Sampling rate ...... %.1f Hz\n",
+                    1.0 / samplingInterval);
+        }
+    }
+
+    WritePhaseSection(pFile, "II. ",  "Phase A analysis",
+                      pPhaseA, pSamples, numberOfSamples, PHASE_INDEX_A);
+    WritePhaseSection(pFile, "III.",  "Phase B analysis",
+                      pPhaseB, pSamples, numberOfSamples, PHASE_INDEX_B);
+    WritePhaseSection(pFile, "IV. ",  "Phase C analysis",
+                      pPhaseC, pSamples, numberOfSamples, PHASE_INDEX_C);
+
+    /* ---- Summary ---- */
+    fprintf(pFile, "\n  V.  Summary and verdict\n");
+    fprintf(pFile, "  ----------------------------------------------------\n");
+
+    size_t totalClippingEvents =
+          pPhaseA->numberOfClippingEvents
+        + pPhaseB->numberOfClippingEvents
+        + pPhaseC->numberOfClippingEvents;
+
+    int allPhasesCompliant =
+        pPhaseA->isWithinTolerance &&
+        pPhaseB->isWithinTolerance &&
+        pPhaseC->isWithinTolerance;
+
+    unsigned char combinedStatus =
+        pPhaseA->statusFlags |
+        pPhaseB->statusFlags |
+        pPhaseC->statusFlags;
+
+    fprintf(pFile, "    Total clipping events  .. %zu\n",
+            totalClippingEvents);
+    fprintf(pFile, "    All phases compliant  ... %s\n",
+            allPhasesCompliant ? "yes" : "no");
+    fprintf(pFile, "    Combined status word .... 0x%02X\n",
+            combinedStatus);
+
+    fprintf(pFile, "\n    VERDICT: ");
+    if (combinedStatus == 0) {
+        fprintf(pFile,
+                "NOMINAL - all metrics within acceptable operating range.\n");
+    } else if (combinedStatus & StatusBitClipping) {
+        fprintf(pFile,
+                "ANOMALY - sensor saturation observed.  Recommend\n"
+                "             immediate investigation of upstream voltage.\n");
+    } else if (combinedStatus & StatusBitOutOfTolerance) {
+        fprintf(pFile,
+                "NON-COMPLIANT - RMS on one or more phases is outside\n"
+                "             the +/- %.0f %% tolerance band.\n",
+                RmsTolerancePercentage);
+    } else {
+        fprintf(pFile,
+                "REVIEW - non-critical status flag(s) raised.\n");
+    }
+
+    fprintf(pFile, "\n====================================================\n");
+    fprintf(pFile, "End of report.\n");
+
+    fclose(pFile);
+    return 0;
+}
+
+int ExecuteAnalysisPipelineForSingleFile(
+        const char *pInputFilePath,
+        const char *pOutputFilePath)
+{
+    if (pInputFilePath == NULL || pOutputFilePath == NULL) return 1;
+
+    size_t numberOfSamples  = 0;
+    WaveformSample *pSamples =
+        LoadCsvFileIntoSampleArray(pInputFilePath, &numberOfSamples);
+    if (pSamples == NULL) return 1;
+
+    PhaseAnalysisResult phaseA = AnalysePhase(pSamples, numberOfSamples, PHASE_INDEX_A);
+    PhaseAnalysisResult phaseB = AnalysePhase(pSamples, numberOfSamples, PHASE_INDEX_B);
+    PhaseAnalysisResult phaseC = AnalysePhase(pSamples, numberOfSamples, PHASE_INDEX_C);
+
+    int rc = WriteAnalysisReportToFile(
+                pOutputFilePath, pInputFilePath,
+                pSamples, numberOfSamples,
+                &phaseA, &phaseB, &phaseC);
+
+    free(pSamples);
+    return rc;
+}
+
+static int FileNameHasCsvExtension(const char *pName)
+{
+    size_t length = strlen(pName);
+    if (length < 4) return 0;
+
+    const char *pExtension = pName + length - 4;
+    return (pExtension[0] == '.')
+        && (pExtension[1] == 'c' || pExtension[1] == 'C')
+        && (pExtension[2] == 's' || pExtension[2] == 'S')
+        && (pExtension[3] == 'v' || pExtension[3] == 'V');
+}
+
+int ExecuteAnalysisPipelineForDirectory(const char *pDirectoryPath)
+{
+    if (pDirectoryPath == NULL) return 1;
+
+    DIR *pDirectory = opendir(pDirectoryPath);
+    if (pDirectory == NULL) {
+        fprintf(stderr,
+                "ERROR | unable to open directory '%s'\n", pDirectoryPath);
+        return 1;
+    }
+
+    int    overallReturnCode = 0;
+    int    successfullyProcessed = 0;
+    size_t directoryPathLength = strlen(pDirectoryPath);
+    struct dirent *pEntry = NULL;
+
+    while ((pEntry = readdir(pDirectory)) != NULL) {
+        if (!FileNameHasCsvExtension(pEntry->d_name)) continue;
+
+        size_t fileNameLength = strlen(pEntry->d_name);
+
+        size_t inputPathBufferSize = directoryPathLength + fileNameLength + 2;
+        char *pInputPath = (char *)malloc(inputPathBufferSize);
+        if (pInputPath == NULL) {
+            overallReturnCode = 1;
+            continue;
+        }
+        snprintf(pInputPath, inputPathBufferSize, "%s/%s",
+                 pDirectoryPath, pEntry->d_name);
+
+        size_t outputPathBufferSize =
+            directoryPathLength + fileNameLength + 16;
+        char *pOutputPath = (char *)malloc(outputPathBufferSize);
+        if (pOutputPath == NULL) {
+            free(pInputPath);
+            overallReturnCode = 1;
+            continue;
+        }
+        int stemLength = (int)(fileNameLength - 4);
+        snprintf(pOutputPath, outputPathBufferSize,
+                 "%s/%.*s_results.txt",
+                 pDirectoryPath, stemLength, pEntry->d_name);
+
+        printf("INFO  | processing %s\n", pInputPath);
+        printf("      |  -> %s\n", pOutputPath);
+
+        int rc = ExecuteAnalysisPipelineForSingleFile(pInputPath, pOutputPath);
+        if (rc != 0) overallReturnCode = rc;
+        else ++successfullyProcessed;
+
+        free(pInputPath);
+        free(pOutputPath);
+    }
+
+    closedir(pDirectory);
+    printf("INFO  | batch complete - %d file(s) processed\n",
+           successfullyProcessed);
+    return overallReturnCode;
+}
