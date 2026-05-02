@@ -1,0 +1,8 @@
+*.o
+*.exe
+analyser
+results.txt
+*_results.txt
+build/
+.vscode/
+.idea/
