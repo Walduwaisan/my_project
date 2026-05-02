@@ -1,4 +1,13 @@
-
+/*
+ *  ============================================================
+ *  File:     waveform.c
+ *  Purpose:  Implementation of the analytical kernel.  Each
+ *            routine is accompanied by a brief statement of
+ *            the mathematical quantity it evaluates and a note
+ *            on numerical or algorithmic considerations where
+ *            they affect the choice of implementation.
+ *  ============================================================
+ */
 
 #include "waveform.h"
 
@@ -6,7 +15,26 @@
 #include <stdlib.h>
 #include <assert.h>
 
-
+/*
+ *  Theory.
+ *      The root-mean-square of a finite sequence  {v_0,..,v_{n-1}}
+ *      is defined as
+ *
+ *              rms = sqrt( (1/n) * sum_{i=0}^{n-1}  v_i^2 ).
+ *
+ *      For a continuous sinusoid  v(t) = V_p sin(omega t)  the
+ *      closed-form RMS is  V_p / sqrt(2).  A dataset of 1000
+ *      samples drawn from such a signal with V_p = 325 V should
+ *      therefore yield an RMS in the neighbourhood of 229.81 V;
+ *      the sampled result will approach this limit as n grows.
+ *
+ *  Implementation.
+ *      Single pass.  The accumulator is a  double  so that
+ *      quantities of order 10^5 V^2 do not exhaust significand
+ *      precision.  Index traversal is performed by pointer
+ *      addition from the base,  pSamples + sampleIdx , with the
+ *      compiler responsible for scaling by sizeof(WaveformSample).
+ */
 double ComputeRootMeanSquareVoltage(
         const WaveformSample *pSamples,
         size_t numberOfSamples,
@@ -147,4 +175,84 @@ size_t CountClippingEvents(
         }
     }
     return numberOfEventsObserved;
+}
+
+/*
+ *  Tolerance.  IEC-style compliance check: RMS must lie within
+ *  +/- RmsTolerancePercentage of the nominal line voltage.
+ */
+int IsRmsWithinTolerance(double rmsVoltage)
+{
+    double allowedDelta = NominalRmsVoltage *
+                          (RmsTolerancePercentage / 100.0);
+    double lowerBound = NominalRmsVoltage - allowedDelta;
+    double upperBound = NominalRmsVoltage + allowedDelta;
+
+    if (rmsVoltage < lowerBound) return 0;
+    if (rmsVoltage > upperBound) return 0;
+    return 1;
+}
+
+/*
+ *  Status derivation.  Three conditions are encoded into a
+ *  single unsigned byte by bitwise OR of the StatusBit*
+ *  constants.  The resulting word can be tested cheaply at
+ *  call sites:  if (flags & StatusBitClipping) ...
+ */
+unsigned char DeriveStatusFlagsFromAnalysis(const PhaseAnalysisResult *pAnalysis)
+{
+    assert(pAnalysis != NULL);
+
+    unsigned char flags = 0;
+
+    if (pAnalysis->numberOfClippingEvents > 0) {
+        flags |= StatusBitClipping;
+    }
+    if (pAnalysis->isWithinTolerance == 0) {
+        flags |= StatusBitOutOfTolerance;
+    }
+    if (fabs(pAnalysis->directCurrentOffset) > SignificantDcOffsetVoltage) {
+        flags |= StatusBitDcOffset;
+    }
+
+    return flags;
+}
+
+/*
+ *  Composite analysis.  Dispatches to the individual metric
+ *  functions and assembles a PhaseAnalysisResult for return.
+ *  Returned by value:  the structure is small (< 80 bytes on
+ *  all common ABIs), so the copy is inexpensive and the caller
+ *  is freed from ownership concerns.
+ */
+PhaseAnalysisResult AnalysePhase(
+        const WaveformSample *pSamples,
+        size_t numberOfSamples,
+        PhaseIndex phase)
+{
+    PhaseAnalysisResult result;
+
+    result.rootMeanSquareVoltage =
+            ComputeRootMeanSquareVoltage(pSamples, numberOfSamples, phase);
+    result.peakToPeakAmplitude =
+            ComputePeakToPeakAmplitude(pSamples, numberOfSamples, phase);
+    result.directCurrentOffset =
+            ComputeDirectCurrentOffset(pSamples, numberOfSamples, phase);
+    result.populationVariance =
+            ComputePopulationVariance(pSamples, numberOfSamples, phase);
+    result.standardDeviation =
+            sqrt(result.populationVariance);
+
+    FindVoltageExtremes(pSamples, numberOfSamples, phase,
+                        &result.minimumVoltageValue,
+                        &result.maximumVoltageValue);
+
+    result.numberOfClippingEvents =
+            CountClippingEvents(pSamples, numberOfSamples, phase);
+    result.isWithinTolerance =
+            IsRmsWithinTolerance(result.rootMeanSquareVoltage);
+    result.statusFlags =
+            DeriveStatusFlagsFromAnalysis(&result);
+
+    return result;
 }
